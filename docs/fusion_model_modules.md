@@ -98,15 +98,30 @@ and save a checkpoint every epoch.
 * **Sentinel-2:** `COPERNICUS/S2_SR_HARMONIZED`, bands `B4` (red) and `B8` (NIR, 10 m).
   `B8A` (865 nm) is spectrally closer to MODIS b2, but it is 20 m. Use `B8` and let M2's band
   adjustment absorb the difference.
-* **Grid alignment trick:** export both sensors in the same UTM CRS, with grids that share an
-  origin, and with 250 m = 25 × 10 m. Every MODIS pixel then covers exactly 25×25 S2 pixels.
+* **Common export grid (a convenience, not physical alignment).** Exporting both sensors in one
+  UTM CRS on grids with a shared origin and a 25:1 cell ratio only makes the *files* line up, so
+  that one exported MODIS cell sits on a 25×25 block of S2 cells. It does **not** mean a MODIS
+  pixel measured that block:
+  * MODIS products are on a **sinusoidal grid with ~231.66 m cells** (the "250 m" is nominal).
+    Exporting to 250 m UTM **resamples** them. GEE's default is nearest neighbour, which at a
+    231.66 → 250 m ratio silently drops about 1 source pixel in 13. Always call `.resample('bilinear')`.
+  * The real ground footprint of a MODIS observation is **larger than its cell and is not a box**.
+    It grows with view angle, to roughly 2× along-track and ~4.8× across-track at the ±55° scan
+    edge, and its point-spread function is bell/triangle-shaped. A daily MOD09GQ cell can come from
+    any view angle.
+  * MODIS **geolocation error is about 50 m (1σ) at nadir**, worse off-nadir, and it differs from
+    day to day. Sentinel-2's is ~10 m or better.
+
+  So: export on the common grid for convenience, filter out large view angles, then **measure** the
+  PSF and offset per date in M2 (2b′) rather than assuming them.
 
 ```python
 AOI   = ee.Geometry.Rectangle([73.00, 31.30, 73.20, 31.45])   # your fields (lon/lat)
 CRS   = 'EPSG:32643'                                          # UTM zone of the AOI
 START, END = '2023-10-01', '2024-05-31'                       # one growing season
 
-# Snap the origin to a multiple of 250 m so the two grids line up exactly.
+# Snap the origin to a multiple of 250 m so the exported FILES share a grid.
+# (MODIS is still resampled from its native ~231.66 m sinusoidal grid: see above.)
 b = AOI.transform(CRS, 1).bounds().coordinates().get(0).getInfo()
 x0 = (min(p[0] for p in b) // 250) * 250
 y0 = (max(p[1] for p in b) // 250 + 1) * 250
@@ -127,9 +142,12 @@ mod = (ee.ImageCollection('MODIS/061/MOD09GQ')
          .filterBounds(AOI).filterDate(START, END)
          .map(lambda im: im.select(['sur_refl_b01', 'sur_refl_b02'], ['red', 'nir'])
                            .multiply(0.0001)
+                           .resample('bilinear')          # default would be nearest neighbour
                            .copyProperties(im, ['system:time_start'])))
 # MOD09GQ has no cloud flags of its own. Join MOD09GA 'state_1km' bits 0-1 (cloud state)
 # and bit 2 (cloud shadow), and mask on them, in the same way.
+# Also use MOD09GA 'SensorZenith' (scale 0.01 deg): keep cells below ~35-40 deg, so the
+# footprint stays near its nominal size.
 
 def export(img, name, tf):
     ee.batch.Export.image.toDrive(
@@ -151,9 +169,10 @@ Keep a `catalog.csv` with columns `date, sensor, path, clear_fraction`. Every la
 | Sub-module | Why it matters | How |
 |---|---|---|
 | **2a Cloud and shadow mask** | One cloudy pixel in `F1` or `C2` teaches the network nonsense | S2: Cloud Score+ `cs_cdf ≥ 0.6–0.65`, then dilate the mask ~3 px. MODIS: `state_1km` QA |
-| **2b Reproject / resample** | The network needs `C` and `F` on the same grid | Export as above, then bilinear-upsample MODIS ×25 to 10 m |
+| **2b Reproject / resample** | The network needs `C` and `F` on the same grid | Export as above, then bilinear-upsample MODIS to the 10 m grid |
+| **2b′ PSF and offset estimation** | A MODIS cell is neither a 25×25 box nor exactly where its coordinates say. Assuming it is biases the band adjustment and teaches the network false "change" | Per clear same-day pair, grid-search the Gaussian PSF width and the (dy, dx) offset that make degraded S2 best match MODIS (`fit_psf_and_shift` below). Shift that day's MODIS by (−dy, −dx) |
 | **2c Co-registration** | Even a 1-pixel S2 shift between dates creates false "change" at field edges | AROSICS `COREG_LOCAL` of every S2 date against one master date |
-| **2d Spectral band adjustment** | MODIS b1/b2 and S2 B4/B8 have different spectral response, so NDVI from each is biased | Per band, regress S2 aggregated to 250 m on MODIS for clear same-day pairs (`F_agg = a·C + b`), then apply `a, b` to every MODIS image |
+| **2d Spectral band adjustment** | MODIS b1/b2 and S2 B4/B8 have different spectral response, so NDVI from each is biased | Per band, regress S2 degraded with the fitted PSF and offset on MODIS, for clear same-day pairs (`F_deg = a·C + b`). Then apply `a, b` to every MODIS image |
 | **2e Normalisation** | Stable training | Reflectance is already 0–1. Clip to `[0, 1]`; optionally divide each band by its 99th percentile |
 
 ```python
@@ -167,22 +186,59 @@ def upsample_to_fine(coarse_path, fine_path):
     with rasterio.open(coarse_path) as c:
         return c.read(out_shape=(c.count, H, W), resampling=Resampling.bilinear).astype('float32')
 
-def aggregate_to_coarse(fine, k=25):
-    """Block-average S2 to the 250 m grid (used for band adjustment)."""
-    B, H, W = fine.shape
-    f = fine[:, :H // k * k, :W // k * k].reshape(B, H // k, k, W // k, k)
-    return np.nanmean(f, axis=(2, 4))
+from scipy.ndimage import gaussian_filter, shift as nd_shift
+
+def fit_psf_and_shift(fine, coarse, k=25, sigmas=(0, 5, 10, 15, 20), max_shift=25, step=2):
+    """Find the PSF width (sigma) and offset (dy, dx), in S2 pixels, that make S2 degraded to the
+    coarse grid best match MODIS. fine: S2 band [H, W] on the 10 m grid. coarse: MODIS band
+    [H//k, W//k] on the matching export grid. Run it on each clear same-day pair (NIR works best)."""
+    h, w = coarse.shape
+    p = max_shift
+    best = dict(r=-np.inf)
+    for s in sigmas:
+        g = np.pad(gaussian_filter(fine, s, mode='nearest') if s else fine, p, mode='edge')
+        for dy in range(-p, p + 1, step):
+            for dx in range(-p, p + 1, step):
+                win = g[p - dy:p - dy + h * k, p - dx:p - dx + w * k]   # = fine shifted by (dy, dx)
+                sim = win.reshape(h, k, w, k).mean(axis=(1, 3))
+                m = np.isfinite(sim) & np.isfinite(coarse)
+                r = np.corrcoef(sim[m], coarse[m])[0, 1]
+                if r > best['r']:
+                    best = dict(sigma=s, dy=dy, dx=dx, r=r)
+    return best
+
+def degrade_to_coarse(fine, sigma, dy, dx, k=25):
+    """S2 [B, H, W] -> what MODIS should have recorded, given the fitted PSF and offset."""
+    g = np.stack([gaussian_filter(b, sigma, mode='nearest') if sigma else b for b in fine])
+    g = nd_shift(g, (0, dy, dx), order=1, mode='nearest')
+    B, H, W = g.shape
+    return g[:, :H // k * k, :W // k * k].reshape(B, H // k, k, W // k, k).mean(axis=(2, 4))
+
+def align_modis(modis_fine, dy, dx):
+    """Undo the fitted offset on MODIS already upsampled to 10 m [B, H, W]."""
+    return nd_shift(modis_fine, (0, -dy, -dx), order=1, mode='nearest')
 
 def fit_band_adjustment(pairs):
-    """pairs: list of (modis_250m [B,h,w], s2_10m [B,H,W]) on the same clear day."""
+    """pairs: list of (modis_coarse [B,h,w], s2_10m [B,H,W], fit) on the same clear day,
+    where fit is that day's fit_psf_and_shift result."""
     coefs = []
     for b in range(pairs[0][0].shape[0]):
-        x = np.concatenate([m[b].ravel() for m, _ in pairs])
-        y = np.concatenate([aggregate_to_coarse(s)[b].ravel() for _, s in pairs])
+        x = np.concatenate([m[b].ravel() for m, _, _ in pairs])
+        y = np.concatenate([degrade_to_coarse(s, f['sigma'], f['dy'], f['dx'])[b].ravel()
+                            for _, s, f in pairs])
         ok = np.isfinite(x) & np.isfinite(y)
         coefs.append(np.polyfit(x[ok], y[ok], 1))   # slope, intercept
     return coefs
 ```
+
+On a synthetic field scene with a known blur and offset, `fit_psf_and_shift` recovered both
+exactly (r = 0.999). The plain 25×25 box average used before reached only r = 0.77 against the same
+"MODIS" image. That gap is the error the box assumption puts into the band adjustment.
+
+* **Dates with no clear S2 image** (the days you actually predict) have no pair to fit on. Use the
+  median offset of the nearest fitted dates, and keep view-angle filtering strict on those days.
+* If the best `r` on a pair is low (below ~0.8), that MODIS date is probably cloudy or far
+  off-nadir. Drop it from training.
 
 Co-registration with AROSICS:
 
@@ -351,7 +407,8 @@ class FusionNet(nn.Module):
         return self.decoder(w1 * z1 + w3 * z3)
 ```
 
-**Receptive field note.** Three 3×3 convs see only 7×7 px (70 m), but one MODIS pixel is 25×25 px.
+**Receptive field note.** Three 3×3 convs see only 7×7 px (70 m), but one MODIS cell spans about
+23–25 S2 px, and its real footprint is wider still.
 The change encoder therefore cannot "see" a whole coarse pixel. This is the first thing to improve:
 add dilated convs (dilation 2, 4, 8) or downsample-then-upsample (a U-Net) in 4c.
 
