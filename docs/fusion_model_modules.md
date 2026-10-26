@@ -113,7 +113,7 @@ and save a checkpoint every epoch.
     day to day. Sentinel-2's is ~10 m or better.
 
   So: export on the common grid for convenience, filter out large view angles, then **measure** the
-  PSF and offset per date in M2 (2b′) rather than assuming them.
+  PSF and offset per date in M2 (2d) rather than assuming them.
 
 ```python
 AOI   = ee.Geometry.Rectangle([73.00, 31.30, 73.20, 31.45])   # your fields (lon/lat)
@@ -170,10 +170,10 @@ Keep a `catalog.csv` with columns `date, sensor, path, clear_fraction`. Every la
 |---|---|---|
 | **2a Cloud and shadow mask** | One cloudy pixel in `F1` or `C2` teaches the network nonsense | S2: Cloud Score+ `cs_cdf ≥ 0.6–0.65`, then dilate the mask ~3 px. MODIS: `state_1km` QA |
 | **2b Reproject / resample** | The network needs `C` and `F` on the same grid | Export as above, then bilinear-upsample MODIS to the 10 m grid |
-| **2b′ PSF and offset estimation** | A MODIS cell is neither a 25×25 box nor exactly where its coordinates say. Assuming it is biases the band adjustment and teaches the network false "change" | Per clear same-day pair, grid-search the Gaussian PSF width and the (dy, dx) offset that make degraded S2 best match MODIS (`fit_psf_and_shift` below). Shift that day's MODIS by (−dy, −dx) |
-| **2c Co-registration** | Even a 1-pixel S2 shift between dates creates false "change" at field edges | AROSICS `COREG_LOCAL` of every S2 date against one master date |
-| **2d Spectral band adjustment** | MODIS b1/b2 and S2 B4/B8 have different spectral response, so NDVI from each is biased | Per band, regress S2 degraded with the fitted PSF and offset on MODIS, for clear same-day pairs (`F_deg = a·C + b`). Then apply `a, b` to every MODIS image |
-| **2e Normalisation** | Stable training | Reflectance is already 0–1. Clip to `[0, 1]`; optionally divide each band by its 99th percentile |
+| **2c Co-registration** (before 2d, which needs aligned S2) | Even a 1-pixel S2 shift between dates creates false "change" at field edges | AROSICS `COREG_LOCAL` of every S2 date against one master date |
+| **2d PSF and offset estimation** | A MODIS cell is neither a 25×25 box nor exactly where its coordinates say. Assuming it is biases the band adjustment and teaches the network false "change" | **Estimate** (clear same-day pairs, at 250 m): grid-search the Gaussian PSF width and the (dy, dx) offset that make degraded S2 best match MODIS (`fit_psf_and_shift` below). **Apply** (every day, at 10 m): shift MODIS by (−dy, −dx). The blur is only measured, to degrade S2 for 2e; it is never removed from MODIS. Days without a clear S2 image get the median offset of nearby fitted days, which fixes MODIS's systematic position error but not its day-to-day wobble |
+| **2e Spectral band adjustment** | MODIS b1/b2 and S2 B4/B8 have different spectral response, so NDVI from each is biased | Per band, regress S2 degraded with the fitted PSF and offset on MODIS, for clear same-day pairs (`F_deg = a·C + b`). Then apply `a, b` to every MODIS image |
+| **2f Normalisation** | Stable training | Reflectance is already 0–1. Clip to `[0, 1]`; optionally divide each band by its 99th percentile |
 
 ```python
 import numpy as np, rasterio
